@@ -1,4 +1,4 @@
-name: Extract CoreTrust - iOS 27.0
+name: CoreTrust27 - Firmware Extraction
 
 on:
   workflow_dispatch:
@@ -8,75 +8,105 @@ permissions:
 
 jobs:
   extract:
+    name: Extract iOS 27.0 CoreTrust
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install IPSW tools
+      - name: Install IPSW
         run: |
-          brew update
           brew install blacktop/tap/ipsw
-
-      - name: Check IPSW tool
-        run: |
           ipsw version
 
-      - name: Download firmware
+      - name: Create directories
         run: |
-          mkdir -p firmware extracted
+          mkdir -p firmware extracted reports
+
+      - name: Download iOS 27.0
+        run: |
           ipsw download ipsw \
             --device iPhone14,5 \
             --version 27.0 \
             --output firmware/
 
-      - name: Inspect downloaded firmware
+      - name: Verify firmware
         run: |
-          find firmware -type f -maxdepth 2 -print
-
-      - name: Extract firmware
-        run: |
-          IPSW=$(find firmware -name "*.ipsw" -type f | head -n 1)
+          IPSW=$(find firmware -type f -name "*.ipsw" | head -n 1)
 
           if [ -z "$IPSW" ]; then
-            echo "Firmware download failed."
+            echo "::error::No IPSW downloaded."
             exit 1
           fi
 
-          ipsw extract --dyld "$IPSW" -o extracted/
+          echo "IPSW=$IPSW" >> "$GITHUB_ENV"
+          ls -lh "$IPSW"
 
-      - name: Locate CoreTrust artifacts
-        run: |
-          find extracted -type f \
-            \( -iname '*CoreTrust*' \
-            -o -iname '*Security*' \
-            -o -iname '*AMFI*' \) \
-            -print | tee extracted/coretrust-files.txt
+          ipsw info "$IPSW"
 
-      - name: Package results
+      - name: Extract dyld shared cache
         run: |
-          tar -czf coretrust27-artifacts.tar.gz extracted/
+          ipsw extract \
+            --dyld \
+            --dyld-arch arm64e \
+            --output extracted/ \
+            "$IPSW"
+
+      - name: Locate shared cache
+        run: |
+          find extracted -type f -print
+
+          DSC=$(find extracted -type f \
+            -name "dyld_shared_cache_arm64e" | head -n 1)
+
+          if [ -z "$DSC" ]; then
+            echo "::error::arm64e shared cache not found."
+            exit 1
+          fi
+
+          echo "DSC=$DSC" >> "$GITHUB_ENV"
+
+      - name: Inspect shared cache
+        run: |
+          ipsw dyld info "$DSC" | tee reports/dyld-info.txt
+
+      - name: Locate CoreTrust
+        run: |
+          ipsw dyld info "$DSC" \
+            > reports/dyld-inventory.txt
+
+          grep -i -n -E \
+            'CoreTrust|CoreTrust.framework' \
+            reports/dyld-inventory.txt \
+            | tee reports/coretrust-search.txt || true
+
+      - name: Extract CoreTrust image
+        run: |
+          mkdir -p extracted/CoreTrust
+
+          ipsw dyld extract "$DSC" CoreTrust \
+            -o extracted/CoreTrust/ || true
+
+          find extracted/CoreTrust -type f -print
+
+      - name: Generate checksums
+        run: |
+          find extracted -type f -exec shasum -a 256 {} \; \
+            > reports/SHA256SUMS.txt
+
+      - name: Package research artifacts
+        run: |
+          tar -czf CoreTrust27-iOS-27.0.tar.gz \
+            extracted reports
+
+          ls -lh CoreTrust27-iOS-27.0.tar.gz
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: CoreTrust27-iOS-27.0
-          path: coretrust27-artifacts.tar.gz
+          path: CoreTrust27-iOS-27.0.tar.gz
+          if-no-files-found: error
           retention-days: 7
-:::
-
-### Running it
-
-1. Commit the workflow.
-2. Open your repository's **Actions** tab.
-3. Select `Extract CoreTrust - iOS 27.0`.
-4. Press **Run workflow**.
-5. Download `CoreTrust27-iOS-27.0`.
-
-### Next milestone
-
-Once you upload the artifact here, we'll inspect the extracted files and identify the actual CoreTrust implementation.
-
-**Our target remains iOS 27.0 build 24A437.**

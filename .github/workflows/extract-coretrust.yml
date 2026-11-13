@@ -1,7 +1,10 @@
-name: CoreTrust27 - Firmware Extraction
+name: CoreTrust 27.0 Extraction
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/extract-coretrust.yml"
 
 permissions:
   contents: read
@@ -10,103 +13,105 @@ jobs:
   extract:
     name: Extract iOS 27.0 CoreTrust
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install IPSW
+      - name: Install dependencies
         run: |
-          brew install blacktop/tap/ipsw
+          brew install blacktop/tap/ipsw jq
+
           ipsw version
 
-      - name: Create directories
+      - name: Prepare directories
         run: |
           mkdir -p firmware extracted reports
 
-      - name: Download iOS 27.0
+      - name: Download iOS 27.0 dyld cache
         run: |
           ipsw download ipsw \
             --device iPhone14,5 \
-            --version 27.0 \
-            --output firmware/
-
-      - name: Verify firmware
-        run: |
-          IPSW=$(find firmware -type f -name "*.ipsw" | head -n 1)
-
-          if [ -z "$IPSW" ]; then
-            echo "::error::No IPSW downloaded."
-            exit 1
-          fi
-
-          echo "IPSW=$IPSW" >> "$GITHUB_ENV"
-          ls -lh "$IPSW"
-
-          ipsw info "$IPSW"
-
-      - name: Extract dyld shared cache
-        run: |
-          ipsw extract \
+            --build 24A437 \
             --dyld \
             --dyld-arch arm64e \
-            --output extracted/ \
-            "$IPSW"
+            --output firmware \
+            --confirm
 
-      - name: Locate shared cache
+      - name: Locate dyld shared cache
         run: |
-          find extracted -type f -print
-
-          DSC=$(find extracted -type f \
-            -name "dyld_shared_cache_arm64e" | head -n 1)
+          DSC=$(find firmware \
+            -type f \
+            -name "dyld_shared_cache_arm64e" \
+            | head -n 1)
 
           if [ -z "$DSC" ]; then
-            echo "::error::arm64e shared cache not found."
+            echo "::error::No arm64e dyld shared cache found."
+            find firmware -type f
             exit 1
           fi
 
           echo "DSC=$DSC" >> "$GITHUB_ENV"
 
-      - name: Inspect shared cache
+          echo "Found shared cache:"
+          ls -lh "$DSC"
+
+      - name: Inventory dyld images
         run: |
-          ipsw dyld info "$DSC" | tee reports/dyld-info.txt
+          ipsw dyld info \
+            --dylibs \
+            --json \
+            "$DSC" \
+            > reports/dylibs.json
 
-      - name: Locate CoreTrust
+          jq -r '.dylibs[].name' \
+            reports/dylibs.json \
+            > reports/image-list.txt
+
+      - name: Find CoreTrust-related images
         run: |
-          ipsw dyld info "$DSC" \
-            > reports/dyld-inventory.txt
+          grep -iE \
+            'coretrust|libmis|amfi|codesign' \
+            reports/image-list.txt \
+            | tee reports/candidates.txt || true
 
-          grep -i -n -E \
-            'CoreTrust|CoreTrust.framework' \
-            reports/dyld-inventory.txt \
-            | tee reports/coretrust-search.txt || true
+          if [ ! -s reports/candidates.txt ]; then
+            echo "No matching image names found."
+          fi
 
-      - name: Extract CoreTrust image
+      - name: Extract CoreTrust images
         run: |
           mkdir -p extracted/CoreTrust
 
-          ipsw dyld extract "$DSC" CoreTrust \
-            -o extracted/CoreTrust/ || true
+          while IFS= read -r IMAGE; do
+            [ -z "$IMAGE" ] && continue
 
-          find extracted/CoreTrust -type f -print
+            echo "Extracting: $IMAGE"
+
+            ipsw dyld extract \
+              "$DSC" \
+              "$IMAGE" \
+              --output extracted/CoreTrust \
+              || echo "Extraction failed for: $IMAGE"
+
+          done < reports/candidates.txt
 
       - name: Generate checksums
         run: |
-          find extracted -type f -exec shasum -a 256 {} \; \
+          find extracted -type f \
+            -exec shasum -a 256 {} \; \
             > reports/SHA256SUMS.txt
 
-      - name: Package research artifacts
-        run: |
-          tar -czf CoreTrust27-iOS-27.0.tar.gz \
-            extracted reports
+          echo "Extracted files:"
+          find extracted -type f -exec ls -lh {} \;
 
-          ls -lh CoreTrust27-iOS-27.0.tar.gz
-
-      - name: Upload artifacts
+      - name: Upload research results
         uses: actions/upload-artifact@v4
         with:
-          name: CoreTrust27-iOS-27.0
-          path: CoreTrust27-iOS-27.0.tar.gz
+          name: CoreTrust-iOS-27.0-arm64e
+          path: |
+            extracted/
+            reports/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
